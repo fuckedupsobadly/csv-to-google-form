@@ -125,6 +125,9 @@ class Cells(unittest.TestCase):
             g.cell_to_fields("5/3/2026", self.q["Visit date"])  # ambiguous without --date-format
         self.assertEqual(g.cell_to_fields("2:05 PM", self.q["Visit time"]),
                          [("entry.1007_hour", "14"), ("entry.1007_minute", "05")])
+        duration = g.Question("Time spent", g.TIME, 1011, duration=True)
+        self.assertEqual(g.cell_to_fields("0:45", duration),
+                         [("entry.1011_hour", "00"), ("entry.1011_minute", "45"), ("entry.1011_second", "00")])
 
     def test_scale_from_spreadsheet(self):
         self.assertEqual(g.cell_to_fields("4.0", self.q["Satisfaction"]), [("entry.1005", "4")])
@@ -154,6 +157,101 @@ class CsvAndLog(unittest.TestCase):
             self.assertEqual(g.load_log(p, "FORM_A"), {1, 2})
             self.assertEqual(g.load_log(p, "FORM_B"), {7})
             self.assertEqual(g.load_log(os.path.join(d, "none"), "FORM_A"), set())
+
+
+class FakeGoogle:
+    """Stands in for g.http: serves the mock form and records every POST."""
+
+    def __init__(self, html=HTML, post_statuses=None, fail_on_post=None):
+        self.html, self.posts = html, []
+        self.post_statuses = list(post_statuses or [])
+        self.fail_on_post = fail_on_post  # raise a network error on this POST number (1-based)
+
+    def __call__(self, url, data=None):
+        if data is None:
+            return 200, URL, self.html
+        self.posts.append(dict(p.split("=", 1) for p in data.decode().split("&")))
+        if self.fail_on_post == len(self.posts):
+            raise OSError("connection reset")
+        return (self.post_statuses.pop(0) if self.post_statuses else 200), url, ""
+
+
+class EndToEnd(unittest.TestCase):
+    """Runs main() for real against FakeGoogle; nothing touches the network."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.csv = os.path.join(self.dir.name, "survey.csv")
+        example = os.path.join(os.path.dirname(__file__), "..", "example", "survey.csv")
+        with open(example, encoding="utf-8") as src, open(self.csv, "w", encoding="utf-8") as dst:
+            dst.write(src.read())
+        self.real_http, self.real_sleep = g.http, g.time.sleep
+        g.time.sleep = lambda s: None
+
+    def tearDown(self):
+        g.http, g.time.sleep = self.real_http, self.real_sleep
+        self.dir.cleanup()
+
+    def run_main(self, fake, *args):
+        g.http = fake
+        with open(os.devnull, "w") as null:
+            out, err = sys.stdout, sys.stderr
+            sys.stdout = sys.stderr = null
+            try:
+                return g.main([URL, self.csv, *args])
+            finally:
+                sys.stdout, sys.stderr = out, err
+
+    def test_dry_run_sends_nothing(self):
+        fake = FakeGoogle()
+        self.assertEqual(self.run_main(fake), 0)
+        self.assertEqual(fake.posts, [])
+
+    def test_submit_then_resume(self):
+        fake = FakeGoogle()
+        self.assertEqual(self.run_main(fake, "--submit", "--limit", "1"), 0)
+        self.assertEqual(len(fake.posts), 1)
+        first = fake.posts[0]
+        self.assertEqual(first["entry.1001"], "Aida")
+        self.assertEqual(first["pageHistory"], "0%2C1")
+        self.assertEqual(first["fbzx"], "-123456789")
+
+        fake2 = FakeGoogle()
+        self.assertEqual(self.run_main(fake2, "--submit"), 0)
+        self.assertEqual([p["entry.1001"] for p in fake2.posts], ["Bekzat", "Dana", "Erlan"])
+        self.assertEqual(self.run_main(FakeGoogle(), "--submit"), 0)  # nothing left, nothing sent
+
+    def test_network_error_does_not_log_the_row(self):
+        fake = FakeGoogle(fail_on_post=2)
+        self.assertEqual(self.run_main(fake, "--submit"), 1)
+        self.assertEqual(g.load_log(self.csv + ".submitted", "FORMID123"), {1})
+
+    def test_rejected_row_stops_the_run(self):
+        fake = FakeGoogle(post_statuses=[200, 400, 400])
+        self.assertEqual(self.run_main(fake, "--submit"), 1)
+        self.assertEqual(g.load_log(self.csv + ".submitted", "FORMID123"), {1})
+
+    def test_bad_cell_blocks_everything(self):
+        with open(self.csv, "a", encoding="utf-8") as f:
+            f.write("2026-05-05,Zara,70+,Apples,5,2026-05-05,10:00,Good,Good,\n")
+        fake = FakeGoogle()
+        self.assertEqual(self.run_main(fake, "--submit"), 1)
+        self.assertEqual(fake.posts, [])
+
+    def test_branching_form_retries_with_visited_pages(self):
+        form = g.parse_form(HTML, URL)
+        g.http = fake = FakeGoogle(post_statuses=[400, 200])
+        self.assertEqual(g.submit(form, [("entry.1001", "A")], {0}), 200)
+        self.assertEqual([p["pageHistory"] for p in fake.posts], ["0%2C1", "0"])
+
+    def test_unreadable_form_is_a_clean_error(self):
+        broken = HTML.replace(json.dumps(DATA), "[null, 5]")
+        self.assertEqual(self.run_main(FakeGoogle(html=broken)), 2)
+
+    def test_utf16_csv(self):
+        with open(self.csv, "w", encoding="utf-16") as f:
+            f.write("Name,Age group\nAida,18-24\n")
+        self.assertEqual(g.read_csv(self.csv), (["Name", "Age group"], [["Aida", "18-24"]]))
 
 
 if __name__ == "__main__":

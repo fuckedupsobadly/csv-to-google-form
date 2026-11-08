@@ -25,11 +25,12 @@ Dry run: nothing was sent. Next: add --submit --limit 1, then check the form's R
 - **Checks everything before sending anything.** If one cell in row 87 doesn't match the form, you find out before row 1 is sent.
 - **Never sends a row twice.** Sent rows are logged; if a run stops halfway, run the same command again and it continues where it stopped.
 - **Handles the awkward cases:** checkbox cells with several answers, options that contain commas, "Other" answers, `18-24` vs `18–24`, `4.0` from spreadsheets, semicolon-separated CSVs from Excel, non-UTF-8 files, multi-section forms, Google Sheets exports (the Timestamp column is skipped).
-- **No dependencies.** Python 3.8+ standard library only. No API keys, no Google account login.
+- **Every question type that can hold an answer:** short answer, paragraph, multiple choice, checkboxes, dropdown, linear scale, star rating, multiple-choice grid, checkbox grid, date, date + time, time and duration. All of them have been tested end to end on a live Google Form.
+- **No dependencies.** Python 3.9+ standard library only. No API keys, no Google account login.
 
 ## Requirements
 
-- Python 3.8 or newer (`python3 --version`).
+- Python 3.9 or newer (`python3 --version`).
 - A Google Form that anyone with the link can fill in. The script can't fill forms that require signing in (see [Limitations](#limitations)).
 
 ## Quick start
@@ -78,9 +79,11 @@ One header row, then one row per response. Export from Excel, Google Sheets or L
 | Checkboxes | Options separated by `;` or `,` | `Apples; Pears` |
 | "Other" option | The text itself; anything that isn't an option becomes the "Other" answer | `Apples, mango` |
 | Linear scale, rating | The number | `4` |
-| Date | `YYYY-MM-DD` or `DD.MM.YYYY` (other formats: `--date-format`) | `2026-05-03` |
+| Date | `YYYY-MM-DD` or `DD.MM.YYYY` (other formats: `--date-format`). If the question has no year, the year is ignored | `2026-05-03` |
+| Date + time | The date, a space, then the time | `2026-05-03 14:30` |
 | Time | `HH:MM`, 24-hour or with AM/PM | `14:30`, `2:30 PM` |
-| Grid | One column per row of the grid, titled `Question [Row]` (how Google Sheets exports grids) | column `Rate us [Food]`, cell `Good` |
+| Duration | `H:MM` or `H:MM:SS` | `1:15:00` |
+| Grid | One column per row of the grid, titled `Question [Row]` (how Google Sheets exports grids). For a checkbox grid, separate several answers with `,` or `;` | column `Rate us [Food]`, cell `Good` |
 | Optional question | Leave the cell empty to skip it | |
 
 Options that contain a comma (`Yes, often`) are fine in checkbox cells: the script matches the form's real options instead of blindly splitting on commas.
@@ -113,8 +116,8 @@ Rows that were accepted are written to `<your csv>.submitted` (one line per row,
 - **File-upload questions** can't be filled. If one is required, the form can't be used.
 - **Timestamps are the time of import.** Google stamps each response when it arrives; there is no way to set an earlier date. If dates matter, keep them in a question of their own.
 - **Each row is sent as-is.** The script doesn't follow "go to section based on answer" logic for you; it sends the answers that are in the row. For forms with branching, leave the cells of skipped sections empty.
-- **Google can change its forms.** The script relies on the structure of Google's form page, which isn't an official API. If it stops working, please open an issue.
-- Date, time, grid and rating questions are covered by the offline tests but haven't been tested against as many live forms as text, multiple choice, checkbox and scale questions. Always send one test row first.
+- **Answer rules aren't checked in advance.** If a question has response validation ("number between 1 and 10", "must be an email"), a cell that breaks the rule is only caught when Google rejects that row.
+- **Google can change its forms.** The script relies on the structure of Google's form page, which isn't an official API. If it stops working, please open an issue. This is also why you should always send one test row first.
 
 ## Use it honestly
 

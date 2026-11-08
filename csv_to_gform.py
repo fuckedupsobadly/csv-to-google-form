@@ -66,6 +66,7 @@ class Question:
     page: int = 0
     has_time: bool = False  # date questions only
     has_year: bool = True   # date questions only
+    duration: bool = False  # time questions only: a length of time, not a time of day
 
     @property
     def multi(self) -> bool:
@@ -198,7 +199,14 @@ def parse_form(html: str, final_url: str) -> Form:
     m = re.search(r"FB_PUBLIC_LOAD_DATA_\s*=\s*(.*?);\s*</script>", html, re.S)
     if not m:
         raise FormError("Couldn't find the form's questions on the page. Is the link right and the form public?")
-    data = json.loads(m.group(1))
+    try:
+        return _parse_form_data(json.loads(m.group(1)), html, final_url)
+    except (ValueError, IndexError, TypeError, AttributeError) as e:
+        raise FormError(f"Couldn't understand the form's data ({type(e).__name__}: {e}). Google may have "
+                        "changed its form pages; please open an issue.") from e
+
+
+def _parse_form_data(data: list, html: str, final_url: str) -> Form:
     body = data[1]
     settings = body[10] if len(body) > 10 and body[10] else []
 
@@ -222,6 +230,8 @@ def parse_form(html: str, final_url: str) -> Form:
         if kind == DATE and len(ans) > 7 and ans[7]:
             q.has_time = bool(ans[7][0])
             q.has_year = bool(ans[7][1]) if len(ans[7]) > 1 else True
+        if kind == TIME and len(ans) > 6 and ans[6]:
+            q.duration = bool(ans[6][0])
         questions.append(q)
 
     form_id = re.search(r"/forms/d/(?:e/)?([\w-]+)", final_url).group(1)
@@ -272,6 +282,8 @@ def read_csv(path: str, encoding: str | None = None, delimiter: str | None = Non
         raw = f.read()
     if encoding:
         text = raw.decode(encoding)
+    elif raw[:2] in (b"\xff\xfe", b"\xfe\xff"):  # Excel "Unicode Text" / UTF-16 exports
+        text = raw.decode("utf-16")
     else:
         try:
             text = raw.decode("utf-8-sig")
@@ -362,6 +374,8 @@ def cell_to_fields(value: str, q: Question, date_format: str | None = None) -> l
         return out
     if q.kind == TIME:
         h, m, s = parse_time(value)
+        if q.duration and s is None:
+            s = 0  # duration questions always have a seconds box
         out = [(key + "_hour", f"{h:02d}"), (key + "_minute", f"{m:02d}")]
         return out + ([(key + "_second", f"{s:02d}")] if s is not None else [])
 
@@ -538,8 +552,15 @@ def main(argv=None) -> int:
             print(f"\nRow {n} would be sent as:")
             names = {f"entry.{q.entry}": q.title for q in pairs.values()}
             for name, value in fields:
-                base = name.split(".other_option_response")[0].split("_")[0]
-                print(f"  {names.get(base, name)[:40]:40} = {value}")
+                if value == "__other_option__":
+                    continue
+                m = re.match(r"(entry\.\d+)(?:_(\w+)|\.other_option_response)?$", name)
+                label = names.get(m.group(1), name) if m else name
+                if m and m.group(2):
+                    label = f"{label[:32]} ({m.group(2)})"
+                elif name.endswith(".other_option_response"):
+                    label = f"{label[:32]} (other)"
+                print(f"  {label[:40]:40} = {value}")
         print("\nDry run: nothing was sent. Next: add --submit --limit 1, then check the form's Responses tab.")
         return 0
 
@@ -558,8 +579,14 @@ def main(argv=None) -> int:
     for k, (n, fields, pages) in enumerate(todo):
         try:
             status = submit(form, fields, pages)
-        except urllib.error.URLError as e:
-            status = f"network error ({e.reason})"
+        except (OSError, KeyboardInterrupt) as e:
+            # The request may have reached Google before the connection broke, so we can't
+            # tell whether this row was recorded. Don't log it, but warn about a duplicate.
+            why = "interrupted" if isinstance(e, KeyboardInterrupt) else f"network error: {e}"
+            print(f"\nrow {n}: {why}. Stopped; {sent} sent in this run.", file=sys.stderr)
+            print(f"  Row {n} may or may not have been recorded. Check the Responses tab: if it's there,\n"
+                  f"  add the line '{form.form_id}\t{n}' to {log_path} before running again.", file=sys.stderr)
+            return 1
         if status != 200:
             print(f"\nrow {n}: Google answered {status}. Stopped; {sent} sent in this run.", file=sys.stderr)
             if status == 400:
@@ -572,7 +599,11 @@ def main(argv=None) -> int:
         sent += 1
         print(f"row {n} sent ({len(done) + sent}/{len(payloads)})")
         if k < len(todo) - 1:
-            time.sleep(args.delay)
+            try:
+                time.sleep(args.delay)
+            except KeyboardInterrupt:
+                print(f"\nStopped. {sent} sent in this run; run the same command to continue.")
+                return 1
     print(f"\nDone: {sent} sent in this run, {len(done) + sent}/{len(payloads)} in total.")
     return 0
 
