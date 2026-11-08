@@ -38,7 +38,7 @@ Dry run: nothing was sent. Next: add --submit --limit 1, then check the form's R
 **1. Download the script**
 
 ```bash
-git clone https://github.com/OWNER/csv-to-google-form.git
+git clone https://github.com/fuckedupsobadly/csv-to-google-form.git
 cd csv-to-google-form
 ```
 
