@@ -148,15 +148,83 @@ class CsvAndLog(unittest.TestCase):
             self.assertEqual(header, ["Имя", "Возраст"])
             self.assertEqual(rows, [["Айгерим", "20"]])
 
-    def test_log_is_per_form(self):
+    def test_log_is_per_form_and_remembers_content(self):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "a.csv.submitted")
-            g.append_log(p, "FORM_A", 1)
-            g.append_log(p, "FORM_A", 2)
-            g.append_log(p, "FORM_B", 7)
-            self.assertEqual(g.load_log(p, "FORM_A"), {1, 2})
-            self.assertEqual(g.load_log(p, "FORM_B"), {7})
-            self.assertEqual(g.load_log(os.path.join(d, "none"), "FORM_A"), set())
+            g.append_log(p, "FORM_A", 1, "aaa")
+            g.append_log(p, "FORM_A", 2, "bbb")
+            g.append_log(p, "FORM_B", 7, "ccc")
+            with open(p, "a") as f:
+                f.write("FORM_A\t3\n")  # line written by version 1.0 (no content hash)
+            self.assertEqual(g.load_log(p, "FORM_A"), {1: "aaa", 2: "bbb", 3: None})
+            self.assertEqual(g.load_log(p, "FORM_B"), {7: "ccc"})
+            self.assertEqual(g.load_log(os.path.join(d, "none"), "FORM_A"), {})
+
+    def test_row_key_ignores_surrounding_spaces_only(self):
+        self.assertEqual(g.row_key(["a ", " b"]), g.row_key(["a", "b"]))
+        self.assertNotEqual(g.row_key(["a", "b"]), g.row_key(["a", "c"]))
+
+
+class SingleAnswerQuestions(unittest.TestCase):
+    def setUp(self):
+        self.age = g.Question("Age", g.CHOICE, 1, ["18–24", "25–34", "35+"], required=True)
+        self.color = g.Question("Colour", g.CHOICE, 2, ["Red", "Blue"], has_other=True)
+
+    def test_several_answers_in_a_single_choice_question_is_a_clear_error(self):
+        with self.assertRaises(ValueError) as cm:
+            g.cell_to_fields("18–24; 35+", self.age)
+        self.assertIn("only one", str(cm.exception))
+        self.assertIn("Checkboxes", str(cm.exception))
+
+    def test_several_answers_are_not_silently_turned_into_other_text(self):
+        with self.assertRaises(ValueError):
+            g.cell_to_fields("Red; Blue", self.color)
+        self.assertEqual(g.cell_to_fields("Purple", self.color),
+                         [("entry.2", "__other_option__"), ("entry.2.other_option_response", "Purple")])
+
+
+class SkippedSections(unittest.TestCase):
+    def setUp(self):
+        self.name = g.Question("Name", g.SHORT, 1, required=True, page=0)
+        self.sat = g.Question("Satisfaction", g.SCALE, 2, ["1", "2", "3"], required=True, page=1)
+        self.why = g.Question("Why", g.SHORT, 3, page=1)
+        self.pairs = {0: self.name, 1: self.sat, 2: self.why}
+
+    def test_a_wholly_empty_later_section_counts_as_skipped(self):
+        fields, pages, errors = g.row_to_payload(["Aida", "", ""], self.pairs)
+        self.assertEqual((errors, pages), ([], {0}))
+
+    def test_a_partly_filled_section_still_needs_its_required_answers(self):
+        fields, pages, errors = g.row_to_payload(["Aida", "", "because"], self.pairs)
+        self.assertEqual([title for title, _ in errors], ["Satisfaction"])
+
+    def test_the_first_section_is_always_required(self):
+        fields, pages, errors = g.row_to_payload(["", "2", ""], self.pairs)
+        self.assertEqual([title for title, _ in errors], ["Name"])
+
+
+class ErrorReport(unittest.TestCase):
+    def test_rows_are_compressed_into_ranges(self):
+        self.assertEqual(g.compress_rows([1, 2, 3, 5, 7, 8]), "1-3, 5, 7-8")
+
+    def test_problems_are_grouped_by_column(self):
+        errors = [(n, "Q4", f"bad value {n}") for n in (5, 6, 7, 9)] + [(2, "Q1", "is empty")]
+        text = "\n".join(g.format_problems(errors))
+        self.assertIn("Q4: 4 rows (5-7, 9)", text)
+        self.assertIn("Q1: 1 row (2)", text)
+        self.assertEqual(text.count("bad value"), 3)  # at most 3 examples per column
+
+
+class Throttling(unittest.TestCase):
+    def test_classify(self):
+        self.assertEqual(g.classify(200, "https://docs.google.com/forms/d/e/X/formResponse", "ok"), "ok")
+        self.assertEqual(g.classify(429, "https://docs.google.com/forms/d/e/X/formResponse", ""), "limited")
+        self.assertEqual(g.classify(503, "u", ""), "limited")
+        self.assertEqual(g.classify(200, "https://www.google.com/sorry/index?continue=x", ""), "limited")
+        self.assertEqual(g.classify(200, "u", "<div class='g-recaptcha'>"), "limited")
+        self.assertEqual(g.classify(500, "u", ""), "server")
+        self.assertEqual(g.classify(400, "u", ""), "rejected")
+        self.assertEqual(g.classify(404, "u", ""), "rejected")
 
 
 class FakeGoogle:
@@ -173,7 +241,10 @@ class FakeGoogle:
         self.posts.append(dict(p.split("=", 1) for p in data.decode().split("&")))
         if self.fail_on_post == len(self.posts):
             raise OSError("connection reset")
-        return (self.post_statuses.pop(0) if self.post_statuses else 200), url, ""
+        status = self.post_statuses.pop(0) if self.post_statuses else 200
+        if isinstance(status, tuple):  # (status, final_url) to simulate a redirect
+            return status[0], status[1], ""
+        return status, url, ""
 
 
 class EndToEnd(unittest.TestCase):
@@ -186,7 +257,8 @@ class EndToEnd(unittest.TestCase):
         with open(example, encoding="utf-8") as src, open(self.csv, "w", encoding="utf-8") as dst:
             dst.write(src.read())
         self.real_http, self.real_sleep = g.http, g.time.sleep
-        g.time.sleep = lambda s: None
+        self.slept = []
+        g.time.sleep = self.slept.append
 
     def tearDown(self):
         g.http, g.time.sleep = self.real_http, self.real_sleep
@@ -224,12 +296,58 @@ class EndToEnd(unittest.TestCase):
     def test_network_error_does_not_log_the_row(self):
         fake = FakeGoogle(fail_on_post=2)
         self.assertEqual(self.run_main(fake, "--submit"), 1)
-        self.assertEqual(g.load_log(self.csv + ".submitted", "FORMID123"), {1})
+        self.assertEqual(set(g.load_log(self.csv + ".submitted", "FORMID123")), {1})
 
     def test_rejected_row_stops_the_run(self):
         fake = FakeGoogle(post_statuses=[200, 400, 400])
         self.assertEqual(self.run_main(fake, "--submit"), 1)
-        self.assertEqual(g.load_log(self.csv + ".submitted", "FORMID123"), {1})
+        self.assertEqual(set(g.load_log(self.csv + ".submitted", "FORMID123")), {1})
+
+    def test_throttling_waits_and_retries_instead_of_stopping(self):
+        sorry = (429, "https://www.google.com/sorry/index?continue=x")
+        fake = FakeGoogle(post_statuses=[200, 429, sorry, 200, 200, 200])
+        self.assertEqual(self.run_main(fake, "--submit"), 0)
+        self.assertEqual([p["entry.1001"] for p in fake.posts],
+                         ["Aida", "Bekzat", "Bekzat", "Bekzat", "Dana", "Erlan"])
+        self.assertEqual(set(g.load_log(self.csv + ".submitted", "FORMID123")), {1, 2, 3, 4})
+        self.assertEqual(self.slept[1:3], [60, 120])           # backoff waits before each retry
+        self.assertTrue(all(s >= 10 for s in self.slept[3:]))   # and slower pacing afterwards
+
+    def test_throttling_gives_up_after_max_wait(self):
+        fake = FakeGoogle(post_statuses=[200] + [429] * 50)
+        self.assertEqual(self.run_main(fake, "--submit", "--max-wait", "5"), 1)
+        self.assertEqual(set(g.load_log(self.csv + ".submitted", "FORMID123")), {1})
+        self.assertLessEqual(sum(self.slept), 5 * 60 + 10)
+
+    def test_changed_csv_is_not_resumed_blindly(self):
+        self.assertEqual(self.run_main(FakeGoogle(), "--submit", "--limit", "2"), 0)
+        with open(self.csv, encoding="utf-8") as f:
+            text = f.read()
+        with open(self.csv, "w", encoding="utf-8") as f:
+            f.write(text.replace("Bekzat", "Bolat"))  # row 2 changed after it was sent
+        fake = FakeGoogle()
+        self.assertEqual(self.run_main(fake, "--submit"), 1)
+        self.assertEqual(fake.posts, [])
+        fake = FakeGoogle()
+        self.assertEqual(self.run_main(fake, "--submit", "--restart"), 0)  # new data set: start over
+        self.assertEqual(len(fake.posts), 4)
+
+    def test_template_matches_the_form(self):
+        out = os.path.join(self.dir.name, "template.csv")
+        g.http = FakeGoogle()
+        with open(os.devnull, "w") as null:
+            stdout, sys.stdout = sys.stdout, null
+            try:
+                self.assertEqual(g.main([URL, "--template", out]), 0)
+            finally:
+                sys.stdout = stdout
+        with open(out, "rb") as f:
+            self.assertTrue(f.read().startswith(b"\xef\xbb\xbf"))  # BOM, so Excel shows Cyrillic correctly
+        header, rows = g.read_csv(out)
+        form = g.parse_form(HTML, URL)
+        pairs, positional, left_cols, left_qs = g.match_columns(header, form.questions)
+        self.assertEqual((len(pairs), positional, left_cols, left_qs), (9, set(), [], []))
+        self.assertTrue(os.path.exists(out + ".guide.txt"))
 
     def test_bad_cell_blocks_everything(self):
         with open(self.csv, "a", encoding="utf-8") as f:
@@ -241,7 +359,7 @@ class EndToEnd(unittest.TestCase):
     def test_branching_form_retries_with_visited_pages(self):
         form = g.parse_form(HTML, URL)
         g.http = fake = FakeGoogle(post_statuses=[400, 200])
-        self.assertEqual(g.submit(form, [("entry.1001", "A")], {0}), 200)
+        self.assertEqual(g.submit(form, [("entry.1001", "A")], {0})[0], 200)
         self.assertEqual([p["pageHistory"] for p in fake.posts], ["0%2C1", "0"])
 
     def test_unreadable_form_is_a_clean_error(self):
